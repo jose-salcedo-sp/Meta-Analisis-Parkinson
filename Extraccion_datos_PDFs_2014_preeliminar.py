@@ -29,6 +29,8 @@ import pandas as pd
 import io
 import re
 import os
+import re
+import numpy as np
 
 #%% Función para extraer el archivo PDF del ZIP
 def extraer_pdf_desde_zip(ruta_zip, nombre_pdf):
@@ -140,6 +142,55 @@ def buscar_pagina_con_tablas(pdf_reader):
     print("  No se encontró ninguna página con tablas usando los patrones de búsqueda")
     return -1  # Retorna -1 si no se encuentra la página
 
+#%% Helper functions
+def parse_first_item(item):
+    """
+    Separa el nombre del estado (parte de texto) de cualquier número que
+    esté pegado al final.
+    """
+    # Reemplaza múltiples espacios por uno solo (por seguridad)
+    item = re.sub(r'\s+', ' ', item).strip()
+    
+    # Busca una parte sin dígitos seguida opcionalmente de algo numérico
+    match = re.match(r'([^\d]+)(.*)', item)
+    if match:
+        state_part = match.group(1).strip()  # texto (nombre estado)
+        number_part = match.group(2).strip() # lo que quede (puede ser dígitos u otro)
+    else:
+        # Si no macha, consideramos todo como nombre
+        state_part = item
+        number_part = ""
+    return state_part, number_part
+
+def split_and_clean(items):
+    """
+    - Si el string contiene guiones, lo parte por espacios ('25 -' -> ['25','-']).
+    - Si NO contiene guiones ('1 047'), elimina espacios internos para leerlo como un solo número ('1047').
+    - Convierte dígitos a int, guiones a NaN.
+    """
+    output = []
+    for piece in items:
+        # Caso 1: Si hay un guion, partimos por espacio
+        if '-' in piece:
+            tokens = piece.split()
+            for t in tokens:
+                t = t.strip().replace(' ', '')  # elimina espacios internos
+                if t.isdigit():
+                    output.append(int(t))
+                elif t == '-':
+                    output.append(np.nan)
+                else:
+                    output.append(np.nan)
+        else:
+            # Caso 2: No hay guion => eliminar todos los espacios internos y tratarlo como un único valor
+            piece_no_spaces = piece.replace(' ', '')
+            if piece_no_spaces.isdigit():
+                output.append(int(piece_no_spaces))
+            else:
+                # Si no es dígito limpio, lo convertimos a NaN
+                output.append(np.nan)
+    return output
+
 #%% Función para extraer las tablas de la página específica
 def extraer_tablas_de_pagina(pdf_reader, pagina_num):
     """
@@ -159,23 +210,13 @@ def extraer_tablas_de_pagina(pdf_reader, pagina_num):
         return []
     
     # Extraer el texto de la página
-    pagina = pdf_reader.pages[pagina_num]
-    texto = pagina.extract_text()
+    page = pdf_reader.pages[pagina_num]
     
-    # Intentar detectar si la tabla tiene la estructura semana, acumulado o solo valores actuales
-    tiene_acumulado = "Acum" in texto or "acum" in texto
-    
-    # Dividir el texto en líneas y limpiarlas
-    lineas = [linea.strip() for linea in texto.split('\n') if linea.strip()]
-    
-    # Buscar líneas que pudieran contener títulos de columnas para entender la estructura
-    titulos_columnas = []
-    for idx, linea in enumerate(lineas):
-        if ("Depresión" in linea and "Parkinson" in linea) or "M" in linea and "F" in linea:
-            titulos_columnas.append(linea)
-            break
-    
-    # Lista de entidades federativas completas para la detección
+    def preprocess(line):
+        return re.split(r'\s{2,}', line.replace(',',''))
+
+    lines = map(preprocess, page.extract_text().split('\n'))
+
     entidades = [
         "Aguascalientes", "Baja California", "Baja California Sur", "Campeche", 
         "Coahuila", "Colima", "Chiapas", "Chihuahua", "Distrito Federal", 
@@ -184,110 +225,63 @@ def extraer_tablas_de_pagina(pdf_reader, pagina_num):
         "Querétaro", "Quintana Roo", "San Luis Potosí", "Sinaloa", "Sonora", 
         "Tabasco", "Tamaulipas", "Tlaxcala", "Veracruz", "Yucatán", "Zacatecas", "TOTAL"
     ]
-    
-    # Columnas para el DataFrame
-    columnas = [
+
+    def filter_by_entity(line):
+        if ' ' not in line[0] and line[0] in entidades:
+            return True
+        
+        return " ".join(line[0].split(' ')[:-1]) in entidades
+
+    filtered_lines = list(filter(filter_by_entity, lines))
+    cleaned_data = []
+    for row in filtered_lines:
+        # 1) Separar el primer item (nombre estado + posible número)
+        state, possible_num = parse_first_item(row[0])
+
+        # 2) Construir lista con "possible_num" (si lo hay) y el resto de la fila
+        #    a partir del segundo elemento.
+        rest = []
+        if possible_num:
+            rest.append(possible_num)
+        rest.extend(row[1:])  # Agregar el resto
+
+        # 3) Dividir cada sub-elemento y limpiar
+        numeric_values = split_and_clean(rest)
+
+        # -- En este paso numeric_values puede tener más o menos de 9 elementos. --
+        # Si quieres forzar a que cada fila tenga EXACTAMENTE 9 valores:
+        if len(numeric_values) < 9:
+            # Rellenar con NaN si faltan
+            numeric_values += [np.nan]*(9 - len(numeric_values))
+        elif len(numeric_values) > 9:
+            # Recortar si sobran
+            numeric_values = numeric_values[:9]
+
+        # 4) Agregar la fila completa: [Estado] + 9 valores
+        cleaned_data.append([state] + numeric_values)
+
+    # Definir columnas
+    columns = [
         'ENTIDAD_FEDERATIVA',
-        'Depresion_Sem', 'Depresion_M', 'Depresion_F',
-        'Parkinson_Sem', 'Parkinson_M', 'Parkinson_F',
-        'Alzheimer_Sem', 'Alzheimer_M', 'Alzheimer_F'
+        'Depresion_Sem','Depresion_M','Depresion_F',
+        'Parkinson_Sem','Parkinson_M','Parkinson_F',
+        'Alzheimer_Sem','Alzheimer_M','Alzheimer_F'
     ]
-    
-    # Recolectar datos
-    datos = []
-    
-    # Manejo especial para la detección de entidades federativas
-    for i, linea in enumerate(lineas):
-        entidad_encontrada = None
-        
-        # Primero intentar con entidades compuestas (para evitar coincidencias parciales)
-        entidades_compuestas = ["Baja California Sur", "Baja California", "San Luis Potosí", "Distrito Federal"]
-        for entidad in entidades_compuestas:
-            if linea.startswith(entidad):
-                entidad_encontrada = entidad
-                break
-        
-        # Si no encontramos entidad compuesta, buscar en el resto
-        if not entidad_encontrada:
-            for entidad in entidades:
-                if entidad not in entidades_compuestas and linea.startswith(entidad):
-                    entidad_encontrada = entidad
-                    break
-        
-        if entidad_encontrada:
-            # Extraer valores después de la entidad
-            valores_texto = linea[len(entidad_encontrada):].strip()
-            
-            # Dividir en tokens, eliminando espacios múltiples
-            valores = re.split(r'\s+', valores_texto)
-            valores = [v for v in valores if v]
-            
-            # Procesar valores
-            valores_numericos = []
-            for v in valores:
-                # Manejo de guiones y espacios en blanco
-                if v == '-' or v.strip() == '':
-                    valores_numericos.append(0)
-                else:
-                    # Eliminar cualquier separador de miles (espacios o puntos)
-                    v_limpio = v.replace(' ', '').replace('.', '')
-                    try:
-                        valores_numericos.append(int(v_limpio))
-                    except ValueError:
-                        try:
-                            valores_numericos.append(float(v_limpio))
-                        except ValueError:
-                            # Si no se puede convertir, podría ser parte del nombre
-                            valores_numericos.append(v)
-            
-            # Asegurar que hay valores suficientes (completar con ceros si falta)
-            while len(valores_numericos) < 9:
-                valores_numericos.append(0)
-            
-            # Limitar a máximo 9 valores (para las 3 enfermedades)
-            valores_numericos = valores_numericos[:9]
-            
-            # Manejar caso especial de Baja California
-            # Si ya tenemos "Baja California" y encontramos "Sur", 
-            # puede que sea una continuación de la línea anterior
-            if entidad_encontrada == "Sur" and datos and datos[-1][0] == "Baja California":
-                print(f"  Detectada continuación de Baja California Sur")
-                # Combinar con la fila anterior
-                datos[-1][0] = "Baja California Sur"
-                for j, val in enumerate(valores_numericos):
-                    if j + 1 < len(datos[-1]):
-                        datos[-1][j+1] = val
-            else:
-                # Crear fila y agregar a los datos
-                fila = [entidad_encontrada] + valores_numericos
-                datos.append(fila)
-    
-    # Si no hay datos, devolver lista vacía
-    if not datos:
-        return []
-    
-    # Crear DataFrame con los datos
-    df = pd.DataFrame(datos, columns=columnas)
-    
-    # Limpiar cualquier valor no numérico en columnas que deberían ser numéricas
-    columnas_numericas = columnas[1:]  # Todas excepto ENTIDAD_FEDERATIVA
-    for col in columnas_numericas:
-        df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0).astype(int)
-    
-    # Verificar si hay una fila con "TOTAL" y compararla con la suma de las demás filas
-    if not df.empty and "TOTAL" in df['ENTIDAD_FEDERATIVA'].values:
-        total_row = df[df['ENTIDAD_FEDERATIVA'] == "TOTAL"]
-        otros_rows = df[df['ENTIDAD_FEDERATIVA'] != "TOTAL"]
-        
-        for col in columnas_numericas:
-            suma_calculada = otros_rows[col].sum()
-            valor_total = total_row[col].values[0] if not total_row.empty else 0
-            
-            # Si hay una discrepancia mayor al 5%, podría haber un error en los datos
-            if suma_calculada > 0 and valor_total > 0:
-                discrepancia = abs(suma_calculada - valor_total) / valor_total
-                if discrepancia > 0.05:
-                    print(f"  ⚠️ Posible problema en columna {col}: suma calculada = {suma_calculada}, total reportado = {valor_total}")
+
+    # Crear DataFrame
+    df = pd.DataFrame(cleaned_data, columns=columns)
+
+    # FORMATEAR NÚMEROS MAYORES DE 999
+    # (aunque con estos datos quizá no sea muy común)
+    def formato_miles(x):
+        if pd.isna(x):
+            return np.nan
+        # Si es entero y > 999, poner formato "1,234"
+        if isinstance(x, int) and x > 999:
+            return int(f"{x:,}".replace(",", ""))
+        return int(x)
+
+    df.iloc[:, 1:] = df.iloc[:, 1:].applymap(formato_miles)
     
     return [df]
 
